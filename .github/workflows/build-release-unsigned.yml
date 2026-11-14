@@ -1,0 +1,127 @@
+name: Build Unsigned Release (fork)
+
+# Fork-only workflow: same build as build-release.yml, but WITHOUT SignPath signing.
+# Triggered by v* tag push (the original build-release.yml MUST be disabled in the fork) or manually.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string to use (e.g., v2.5.2)'
+        required: true
+        type: string
+        default: 'v2.5.2-test'
+
+env:
+  PROJECT_NAME: ExplorerTabUtility
+  VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        framework: [ 'net9.0-windows', 'net481' ]
+        arch: [ 'x64', 'x86', 'arm64' ]
+      fail-fast: true
+      max-parallel: 6
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild Environments
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '17.0'
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Build Project
+        run: |
+          $outputDir = "../publish/${{ matrix.framework }}/${{ matrix.arch }}"
+          msbuild "${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj" /restore /t:Publish /p:Configuration=Release /p:TargetFramework=${{ matrix.framework }} /p:RuntimeIdentifier=win-${{ matrix.arch }} /p:PublishDir=$outputDir /p:DebugType=none
+        shell: pwsh
+
+      - name: Zip Artifacts
+        id: zip_artifacts
+        run: |
+          $frameworkName = if ("${{ matrix.framework }}" -eq "net9.0-windows") { "Net9.0_FrameworkDependent" } else { "NetFW4.8.1" }
+          $zipName = "${{ env.PROJECT_NAME }}_${{ env.VERSION }}_${{ matrix.arch }}_${frameworkName}.zip"
+
+          $tempDir = "temp-$(New-Guid)"
+          New-Item -Path "$tempDir/${{ env.PROJECT_NAME }}" -ItemType Directory -Force | Out-Null
+          Copy-Item -Path "publish/${{ matrix.framework }}/${{ matrix.arch }}/*" -Destination "$tempDir/${{ env.PROJECT_NAME }}" -Recurse
+          Compress-Archive -Path "$tempDir/*" -DestinationPath $zipName
+          Remove-Item -Path $tempDir -Recurse -Force
+
+          echo "zipName=$zipName" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip_artifacts.outputs.zipName }}
+          path: ${{ steps.zip_artifacts.outputs.zipName }}
+
+  build-installer:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all ZIP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+        shell: pwsh
+
+      - name: Build Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DMyAppVersion="${{ env.VERSION }}" `
+            /DSourceDir="..\artifacts" `
+            "installers\installer.iss"
+        shell: pwsh
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: artifacts/*.exe
+
+  create-release:
+    needs: build-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download ZIPs
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.PROJECT_NAME }} ${{ env.VERSION }} (unsigned)
+          draft: true
+          generate_release_notes: true
+          body: |
+            **Unsigned build.** Windows SmartScreen may warn: click "More info" -> "Run anyway".
+            If unsure, use `${{ env.PROJECT_NAME }}_${{ env.VERSION }}_Setup.exe` (per-user install, no admin rights needed).
+          files: |
+            release-artifacts/*.zip
+            release-artifacts/*.exe
